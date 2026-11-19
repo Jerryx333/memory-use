@@ -35,10 +35,14 @@ if mode == "signed-out":
 if args[:2] == ["item", "list"]:
     print(json.dumps([meta(i) for i in items]))
 elif args[:2] == ["item", "get"]:
-    hits = [i for i in items if args[2] in (i["id"], i["title"])
+    if "--" not in args:   # without it a reference that looks like a flag would be parsed as one
+        sys.stderr.write("fake op: item reference must follow --\n")
+        sys.exit(3)
+    ref = args[args.index("--") + 1]
+    hits = [i for i in items if ref in (i["id"], i["title"])
             and (flag("--vault") is None or flag("--vault") in (i["vault"]["name"], i["vault"]["id"]))]
     if len(hits) != 1:
-        sys.stderr.write('[ERROR] "%s" isn\'t an item.\n' % args[2])
+        sys.stderr.write('[ERROR] "%s" isn\'t an item.\n' % ref)
         sys.exit(1)
     item = json.loads(json.dumps(hits[0]))
     if "--reveal" not in args:
@@ -50,7 +54,7 @@ elif args[:2] == ["item", "create"] and args[-1] == "-":
     t = json.loads(stdin)
     vault = "Other" if mode == "wrong-vault" else flag("--vault") or "Private"
     item = {"id": "n%025d" % len(items), "title": t["title"], "category": t["category"],
-            "vault": {"id": "v" + vault.lower(), "name": vault}, "tags": (flag("--tags") or "").split(","),
+            "vault": {"id": "v" + vault.lower().replace(" ", ""), "name": vault}, "tags": (flag("--tags") or "").split(","),
             "fields": t["fields"]}
     if mode == "mismatch":
         item["fields"] = [dict(f, value="wrong") if f.get("purpose") == "PASSWORD" else f for f in item["fields"]]

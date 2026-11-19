@@ -518,13 +518,13 @@ BACKENDS = ("1password", "bitwarden")
 
 
 def secret_backend() -> str:
-    """MEMORY_USE_SECRET_BACKEND, else `secret backend <name>` (config), else whichever CLI is installed
-    (bitwarden-use when both are, so existing setups keep working until switched)."""
+    """MEMORY_USE_SECRET_BACKEND, else `secret backend <name>` (config), else bitwarden.
+    1Password is never picked just because `op` is installed: it has to be chosen."""
     b = (os.environ.get("MEMORY_USE_SECRET_BACKEND") or load_config().get("secret_backend") or "").strip().lower()
     b = {"op": "1password", "bw": "bitwarden", "bwu": "bitwarden"}.get(b, b)
     if b and b not in BACKENDS:
         sys.exit(f"unknown secret backend {b!r}: use 1password or bitwarden")
-    return b or ("1password" if op_bin() and not bwu_bin() else "bitwarden")
+    return b or "bitwarden"
 
 
 def bwu_bin() -> str | None:
@@ -534,7 +534,8 @@ def bwu_bin() -> str | None:
 def bwu(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
     b = bwu_bin()
     if not b:
-        sys.exit("bitwarden-use not installed: curl -fsSL https://raw.githubusercontent.com/leeguooooo/bitwarden-use/main/install.sh | sh")
+        sys.exit("bitwarden-use not installed: curl -fsSL https://raw.githubusercontent.com/leeguooooo/bitwarden-use/main/install.sh | sh"
+                 + ("\n(`op` is installed: `memory-use secret backend 1password` switches to the experimental 1Password backend)" if op_bin() else ""))
     return subprocess.run([b, *args], input=stdin, text=True, encoding="utf-8", capture_output=True)
 
 
@@ -615,14 +616,16 @@ def has_secret_tag(item: dict) -> bool:
 
 
 def op_items() -> list[dict]:
-    """Metadata only (id, name, user, vault, tags, type) — never values."""
+    """Metadata only (id, name, user, vault, tags, type) — never values.
+    `vault` is what a pointer can carry (the name, or the id when the name has spaces or brackets);
+    `vault_name` is the name as 1Password has it."""
     r = op("item", "list", "--format", "json")
     if r.returncode:
         sys.exit(op_failure("op item list", r))
     out = []
     for i in json.loads(r.stdout or "[]"):
         v = i.get("vault") or {}
-        out.append({"id": i.get("id"), "name": i.get("title"), "type": i.get("category"), "tags": i.get("tags") or [], "vault_id": v.get("id"),
+        out.append({"id": i.get("id"), "name": i.get("title"), "type": i.get("category"), "tags": i.get("tags") or [], "vault_id": v.get("id"), "vault_name": v.get("name"),
                     # additional_information is the username only for logins; elsewhere it can be a note excerpt
                     "user": (i.get("additional_information") or None) if i.get("category") == "LOGIN" else None,
                     "vault": v.get("name") if re.fullmatch(OP_VAULT_CHARS, v.get("name") or "") else v.get("id")})
@@ -634,7 +637,8 @@ def op_pointer(item: dict) -> str:
 
 
 def op_item(ref: str, vault: str | None = None) -> dict:
-    r = op("item", "get", ref, "--reveal", "--format", "json", *(["--vault", vault] if vault else []))
+    # A reference can come from note text: after `--` it is only ever an item name or id, never a flag.
+    r = op("item", "get", "--reveal", "--format", "json", *(["--vault", vault] if vault else []), "--", ref)
     if r.returncode:
         sys.exit(op_failure("op item get", r))
     return json.loads(r.stdout)
@@ -733,7 +737,7 @@ def op_put(name: str, user: str | None, value: str) -> str:
     except SystemExit:
         sys.exit(PUT_UNCERTAIN)
     new = [i for i in after if i["id"] not in before and i.get("name") == name and has_secret_tag(i)
-           and (user is None or i.get("user") == user) and (vault is None or vault in (i.get("vault"), i.get("vault_id")))]
+           and (user is None or i.get("user") == user) and (vault is None or vault in (i.get("vault_name"), i.get("vault_id")))]
     # exactly one new matching item, and it is the one op says it created
     if len(new) != 1 or new[0]["id"] != created:
         sys.exit(PUT_UNCERTAIN)
@@ -744,7 +748,7 @@ def op_put(name: str, user: str | None, value: str) -> str:
         sys.exit(PUT_UNCERTAIN)
     if not hmac.compare_digest(actual.encode(), value.encode()):
         sys.exit(PUT_UNCERTAIN)
-    return (f"stored in 1Password vault '{new[0]['vault']}' (tag '{secret_tag()}') and read-back verified. "
+    return (f"stored in 1Password vault '{new[0]['vault_name'] or new[0]['vault']}' (tag '{secret_tag()}') and read-back verified. "
             "Put this in the note:\n  🔑 " + op_pointer(new[0]))
 
 
@@ -759,7 +763,7 @@ def secret_value(ref: str, field: str | None) -> str:
     if ref.startswith("bw:") or secret_backend() == "bitwarden":
         r = bwu("get", ref[3:] if ref.startswith("bw:") else ref, "--field", field or "password", "--reveal")
         if r.returncode:
-            sys.exit("bitwarden-use get failed (output hidden): check the pointer with `secret find`, or unlock the vault")
+            sys.exit("bitwarden-use get failed: " + ((r.stderr or "").strip() or "no error output; check the pointer with `secret find`, or unlock the vault"))
         return r.stdout.rstrip("\n")
     return op_field(op_item(ref), field or "password")
 
@@ -823,6 +827,10 @@ def cmd_secret(a) -> int:
         return check_pointers(verbose=True)
     if a.action == "hashes":
         import hashlib
+        source = hashes_source()
+        if source and source != backend:
+            sys.exit(f"{KNOWN_HASHES} was built from {source}, and the secret backend is now {backend}; nothing was written. "
+                     "Delete that file first if the hashes should come from the new backend.")
         out = []
         if backend == "1password":
             where = f"1Password items tagged '{secret_tag()}'"
@@ -840,9 +848,25 @@ def cmd_secret(a) -> int:
         KNOWN_HASHES.parent.mkdir(parents=True, exist_ok=True)
         KNOWN_HASHES.write_text("\n".join(sorted(set(out))) + ("\n" if out else ""), encoding="utf-8")
         os.chmod(KNOWN_HASHES, 0o600)
+        hashes_source_file().write_text(backend + "\n", encoding="utf-8")
         print(f"{len(set(out))} secret hash(es) from {where} → {KNOWN_HASHES} (values never stored)")
         return 0
     sys.exit("unknown secret action")
+
+
+def hashes_source_file() -> Path:
+    return KNOWN_HASHES.with_name(KNOWN_HASHES.name + ".backend")
+
+
+def hashes_source() -> str | None:
+    """Backend the hash file was built from; a file written before backends existed came from Bitwarden."""
+    if not KNOWN_HASHES.exists():
+        return None
+    try:
+        b = hashes_source_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        b = ""
+    return b if b in BACKENDS else "bitwarden"
 
 
 def check_pointers(verbose: bool = False) -> int:
@@ -3084,7 +3108,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("paths", nargs="+"); s.add_argument("-m", "--message", required=True); s.add_argument("--trailer", default=os.environ.get("MEMORY_USE_TRAILER", ""))
     s.add_argument("--no-push", action="store_true", help="commit locally only; autosync or `sync` pushes later")
     s.set_defaults(fn=cmd_save)
-    s = sub.add_parser("secret", help="password-manager pointers (1Password or Bitwarden): find | put | get | refs | hashes | backend (values never printed by default)")
+    s = sub.add_parser("secret", help="password-manager pointers (Bitwarden, or 1Password — experimental): find | put | get | refs | hashes | backend (values never printed by default)")
     s.add_argument("action", choices=["find", "put", "get", "refs", "hashes", "backend"])
     s.add_argument("args", nargs="*")
     s.add_argument("--field", help="get: password (default, or the pointer's field), username, notes, totp, or a field label")

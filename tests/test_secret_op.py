@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-from test_memory_use import ARTICLE_OK, MemoryUseTest, mu
+import test_memory_use as base
+from test_memory_use import ARTICLE_OK, mu
 
 FAKE_OP = Path(__file__).resolve().parent / "fake_op.py"
 ROUTER = "routerid00000000000000000a"
@@ -21,7 +22,7 @@ def login(id_, title, user, pw, vault="Private", tags=()):
                 {"id": "otp", "type": "OTP", "label": "one-time password", "value": "otpauth://x", "totp": "123456"}]}
 
 
-class OnePasswordBackendTest(MemoryUseTest):
+class OnePasswordBackendTest(base.MemoryUseCase):
     def setUp(self):
         super().setUp()
         t = Path(self.tmp.name)
@@ -96,6 +97,25 @@ class OnePasswordBackendTest(MemoryUseTest):
         self.assertNotEqual(rc, 0)
         self.assertNoValues(str(rc) + out)
 
+    def test_failed_bitwarden_read_passes_stderr_but_never_stdout(self):
+        failed = mu.subprocess.CompletedProcess([], 1, "s3cret-bw-pw\n", "error: vault is locked\n")
+        with mock.patch.object(mu, "bwu", return_value=failed):
+            rc, out = self.run_cmd("secret", "get", "bw:11111111-2222-3333-4444-555555555555", "--print")
+        self.assertIn("vault is locked", str(rc))
+        self.assertNoValues(str(rc) + out)
+
+    def test_item_reference_cannot_add_flags(self):
+        for ref in (f"op://Private/{ROUTER}", "op://Private/--share-link", "op://Private/--otp"):
+            with self.subTest(ref=ref):
+                self.log.write_text("")
+                self.run_cmd("secret", "get", ref, "--env", "PW", "--", "/usr/bin/true")
+                argv = self.calls()[-1]["argv"]
+                self.assertEqual(argv[:2], ["item", "get"])
+                self.assertEqual(argv[-2], "--")   # the reference is last and follows the separator
+                self.assertEqual(argv[-1], ref.rsplit("/", 1)[-1])
+        rc, _ = self.run_cmd("secret", "get", "op://Private/--share-link", "--print")
+        self.assertIn("no such item", str(rc))
+
     def test_custom_prefix_skips_builtin_fields(self):
         items = json.loads(self.state.read_text())
         items[0]["fields"].append({"id": "c1", "type": "CONCEALED", "label": "password", "value": "s3cret-custom"})
@@ -136,6 +156,20 @@ class OnePasswordBackendTest(MemoryUseTest):
         self.assertIn("synthetic-pw", create["stdin"])
         self.assertEqual(create["argv"][create["argv"].index("--tags") + 1], "memory")
         self.assertIn("--reveal", self.calls()[-1]["argv"])
+
+    def test_put_into_vault_whose_name_has_a_space(self):
+        os.environ["MEMORY_USE_OP_VAULT"] = "Shared Vault"
+        rc, out = self.put("synthetic-pw\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("stored in 1Password vault 'Shared Vault'", out)
+        self.assertIn("🔑 op://vsharedvault/n0000000000000000000000003（new item）", out)   # a pointer carries the id then
+        self.assertNoValues(out)
+        (self.root / "nas" / "p.md").write_text(ARTICLE_OK + "\n🔑 op://vsharedvault/n0000000000000000000000003\n")
+        self.assertEqual(self.run_cmd("secret", "refs")[0], 0)
+        marker = Path(self.tmp.name) / "seen"
+        rc, out = self.run_cmd("secret", "get", "op://vsharedvault/n0000000000000000000000003", "--env", "PW", "--",
+                               "/bin/sh", "-c", f'printf %s "$PW" > {marker}')
+        self.assertEqual((rc, marker.read_text()), (0, "synthetic-pw"))
 
     def test_put_unverified_outcomes_report_no_pointer(self):
         os.environ["MEMORY_USE_OP_VAULT"] = "Private"
@@ -196,6 +230,42 @@ class OnePasswordBackendTest(MemoryUseTest):
         f.write_text(f"- 路由器密码：🔑 op://Private/{ROUTER}（router）\n- password: op://Private/{ROUTER}/password\n")
         rc, out = self.run_cmd("check", str(f))
         self.assertEqual(rc, 0, out)
+
+    def test_unset_backend_is_bitwarden_whatever_is_installed(self):
+        os.environ.pop("MEMORY_USE_SECRET_BACKEND")
+        for has_op in (True, False):
+            for has_bwu in (True, False):
+                with mock.patch.object(mu, "op_bin", return_value="/x/op" if has_op else None), \
+                        mock.patch.object(mu, "bwu_bin", return_value="/x/bwu" if has_bwu else None):
+                    self.assertEqual(mu.secret_backend(), "bitwarden", (has_op, has_bwu))
+
+    def test_op_only_machine_does_not_switch_to_1password(self):
+        os.environ.pop("MEMORY_USE_SECRET_BACKEND")
+        mu.KNOWN_HASHES.write_text("a" * 64 + "\n")
+        with mock.patch.object(mu, "bwu_bin", return_value=None):
+            for run in (lambda: self.put("synthetic-pw\n"), lambda: self.run_cmd("secret", "hashes"),
+                        lambda: self.run_cmd("secret", "find", "router")):
+                rc, out = run()
+                self.assertIn("bitwarden-use not installed", str(rc))
+                self.assertIn("secret backend 1password", str(rc))
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(mu.KNOWN_HASHES.read_text(), "a" * 64 + "\n")
+        self.assertEqual(len(json.loads(self.state.read_text())), 3)
+
+    def test_hashes_never_replace_a_file_built_from_the_other_backend(self):
+        mu.KNOWN_HASHES.write_text("a" * 64 + "\n")   # no source recorded: written before backends existed, so Bitwarden
+        rc, out = self.run_cmd("secret", "hashes")
+        self.assertIn("was built from bitwarden", str(rc))
+        self.assertEqual(mu.KNOWN_HASHES.read_text(), "a" * 64 + "\n")
+        mu.KNOWN_HASHES.unlink()
+        self.assertEqual(self.run_cmd("secret", "hashes")[0], 0)
+        self.assertEqual(self.run_cmd("secret", "hashes")[0], 0)   # same backend: rebuilt in place
+        built = mu.KNOWN_HASHES.read_text()
+        os.environ["MEMORY_USE_SECRET_BACKEND"] = "bitwarden"
+        with mock.patch.object(mu, "bwu", side_effect=AssertionError("bitwarden-use must not be called")):
+            rc, out = self.run_cmd("secret", "hashes")
+        self.assertIn("was built from 1password", str(rc))
+        self.assertEqual(mu.KNOWN_HASHES.read_text(), built)
 
     def test_backend_is_chosen_by_env_then_config(self):
         os.environ.pop("MEMORY_USE_SECRET_BACKEND")
