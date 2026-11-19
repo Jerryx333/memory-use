@@ -23,7 +23,7 @@ python3 $M eval              # hit@1 / hit@3 of search over evals.md, glossary �
 python3 $M lessons           # topics failed commands keep hitting across sessions; "rewrite this note" = pointed at, never fixed
 python3 $M check [paths]     # secret scan (also the git pre-commit hook)
 python3 $M save vpn/servers.md vpn/todo.md -m "vpn: …" --trailer "Claude-Session: …"
-python3 $M secret find|put|get|refs|hashes|backend …   # password-manager pointers: 1Password (op) or Bitwarden (bitwarden-use), optional
+python3 $M secret find|put|get|refs|hashes|backend …   # password-manager pointers: Bitwarden (bitwarden-use) or, experimental, 1Password (op); optional
 python3 $M remind add "续费 NAS 证书" --due 2026-10-01   # dated reminder → Apple Reminders (macOS, optional)
 ```
 
@@ -103,7 +103,7 @@ Write back whenever the work produced something a future session needs: a new se
 
 `check` scans every non-binary file for private keys, common vendor tokens, JWTs, SSH public key blobs, credentials in URLs, `Authorization` headers, `mysql -p` / `sshpass -p`, and assignments in English or Chinese (`password=…`, `密码：…`, `密码是 …`, `口令 = …`); pointers, paths and prose (`op://…`, `bw:…`, `~/.ssh/…`, `secrets.env`, `不记录，问 X`) pass. Real secrets listed one per line in `~/.config/memory-use/known-secrets` (outside git, chmod 600) are caught verbatim; `secret hashes` catches by hash every password in the `memory` folder (Bitwarden) or in items tagged `memory`, also nested like `imported/memory` (1Password). The pre-commit hook blocks any commit, even one made with plain git.
 
-Backend: `secret backend 1password|bitwarden` (saved in config; `MEMORY_USE_SECRET_BACKEND` overrides). Unset, it uses whichever CLI is installed, Bitwarden when both are. 1Password goes through the official `op` CLI; `MEMORY_USE_OP_VAULT` / config `op_vault` picks the vault for new items (default: op's own), `MEMORY_USE_SECRET_TAG` the tag (default `memory`). `bw:` pointers keep resolving through bitwarden-use whatever the backend.
+Backend: `secret backend 1password|bitwarden` (saved in config; `MEMORY_USE_SECRET_BACKEND` overrides). Unset, it is Bitwarden, also on a computer where only `op` is installed. The 1Password backend is experimental (`put` and `hashes` have not been run against a real account) and goes through the official `op` CLI; `secret hashes` refuses to replace a hash file built from the other backend; `MEMORY_USE_OP_VAULT` / config `op_vault` picks the vault for new items (default: op's own), `MEMORY_USE_SECRET_TAG` the tag (default `memory`). `bw:` pointers keep resolving through bitwarden-use whatever the backend.
 
 `secret put "<name>"` accepts a single-line password on stdin, or `--generate 24`, and reports a `🔑 op://<vault>/<item id>` (or `🔑 bw:<uuid>`) pointer only after checking the new item and exact readback; the value reaches the CLI on stdin, never in arguments. Multiline secrets and private-key blocks are refused before writing; store them as a secure-note or SSH-key item in the password manager. If verification fails, the item may already exist: inspect it before retrying rather than creating another copy. `secret get <pointer> --copy` or `--env VAR -- cmd` uses a value without printing; `op://<vault>/<item>/<field>` or `--field username|notes|totp|<label>` picks another field. With 1Password app integration, the first `find` / `get` in a session asks for the user's approval (Touch ID); `refs` and `lint` never prompt and skip the check while signed out.
 
